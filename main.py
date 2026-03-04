@@ -1,6 +1,7 @@
-def main():
-    print("Hello from repl-nix-workspace!")
+from fastapi import FastAPI
 
+app = FastAPI()
 
-if __name__ == "__main__":
-    main()
+@app.get("/")
+def read_root():
+    return {"message": "AI Shield Gateway is Running!"}
