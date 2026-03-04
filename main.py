@@ -1,104 +1,73 @@
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+import re
+import json
 import os
-import uvicorn
-import requests
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
 
-# --- Import your security and database modules ---
-try:
-    from pii import anonymize_text  # Your PII Logic
-    from db import save_log         # Your DB Logic
-except ImportError:
-    # Fallback to prevent crash if modules are missing
-    def anonymize_text(text): return text, []
-    def save_log(data): print(f"Audit Log: {data}")
+app = FastAPI()
 
-# --- Initialize AI Shield Gateway ---
-app = FastAPI(
-    title="🛡️ AI Shield Gateway (Enterprise Edition)",
-    description="Secure Gateway for PII Redaction and Free AI Routing (Llama 3)",
-    version="2.0.0"
+# Enable CORS for Vercel connectivity
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Fetch Groq API Key from Render Environment Variables
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Configuration - It's better to use Environment Variables on Render
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_gsk_key_here")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# --- Request Data Model ---
-class ChatRequest(BaseModel):
-    prompt: str
-    user_id: Optional[str] = "global_user"
+# PII Shield: Function to redact sensitive data
+def screen_pii(text: str) -> str:
+    # Redact Emails
+    text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', "[EMAIL_REDACTED]", text)
+    # Redact Phone Numbers
+    text = re.sub(r'\b(?:\+?\d{1,3}[- ]?)?\d{8,10}\b', "[PHONE_REDACTED]", text)
+    return text
 
-# --- Main Gateway Endpoint ---
-@app.post("/v1/secure/chat")
-async def secure_gateway_chat(request: ChatRequest):
-    """
-    1. Redacts PII from the input.
-    2. Routes the clean prompt to Llama 3 (via Groq).
-    3. Tracks token usage and logs the transaction.
-    """
-    if not GROQ_API_KEY:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not set in Render settings.")
+# 1. Models Endpoint (Fixes the "Not Found" /v1/models error)
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {"id": "llama3-8b-8192", "object": "model", "owned_by": "groq"},
+            {"id": "llama3-70b-8192", "object": "model", "owned_by": "groq"},
+            {"id": "mixtral-8x7b-32768", "object": "model", "owned_by": "groq"}
+        ]
+    }
 
-    try:
-        # STEP 1: PII Protection Layer (Privacy Control)
-        safe_prompt, detected_entities = anonymize_text(request.prompt)
+# 2. Chat Completions Endpoint (The core logic)
+@app.post("/v1/chat/completions")
+async def chat_proxy(request: Request):
+    body = await request.json()
+    
+    # Apply PII filter to user messages
+    if "messages" in body:
+        for msg in body["messages"]:
+            if msg["role"] == "user":
+                msg["content"] = screen_pii(msg["content"])
 
-        # STEP 2: Intent Routing to Free Model (Llama 3 via Groq)
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "llama3-8b-8192",
-            "messages": [
-                {"role": "system", "content": "You are a secure assistant. Answer the user's prompt."},
-                {"role": "user", "content": safe_prompt}
-            ],
-            "temperature": 0.7
-        }
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-        # Sending request to AI model
-        response = requests.post(url, json=payload, headers=headers)
-        ai_data = response.json()
+    async def stream_generator():
+        async with httpx.AsyncClient() as client:
+            async with client.stream("POST", GROQ_URL, json=body, headers=headers, timeout=60.0) as response:
+                if response.status_code != 200:
+                    error_detail = await response.aread()
+                    yield json.dumps({"error": "Groq API Error", "detail": error_detail.decode()}).encode()
+                    return
+                async for chunk in response.aiter_bytes():
+                    yield chunk
 
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=ai_data)
+    return StreamingResponse(stream_generator(), media_type="application/json")
 
-        # STEP 3: Observability & Usage Metrics
-        ai_reply = ai_data['choices'][0]['message']['content']
-        usage = ai_data.get('usage', {})
-        
-        metrics = {
-            "user_id": request.user_id,
-            "tokens_used": usage.get('total_tokens', 0),
-            "pii_detected": len(detected_entities),
-            "routing": "Groq-Llama3-Free"
-        }
-
-        # STEP 4: Persistent Audit Trail (Database Logging)
-        save_log({**metrics, "original": request.prompt, "clean": safe_prompt})
-
-        # Final Return to User
-        return {
-            "response": ai_reply,
-            "security": {
-                "status": "Protected",
-                "redacted_content": safe_prompt,
-                "entities_found": detected_entities
-            },
-            "usage_analytics": metrics
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal Gateway Error: {str(e)}")
-
-# --- Health Check ---
 @app.get("/")
-def health_check():
-    return {"status": "Active", "engine": "FastAPI", "security": "Enabled"}
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+async def health_check():
+    return {"status": "Active", "proxy": "AI Gateway", "security": "PII Filter Enabled"}
