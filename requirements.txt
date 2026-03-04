@@ -3,5 +3,5 @@ uvicorn
 pydantic
 presidio-analyzer
 presidio-anonymizer
-reportlab
+spacy
 python-multipart
